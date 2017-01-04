@@ -174,28 +174,30 @@ static void init_can( void )
 #define DAC_PWR             A5
 
 // Sensor wire from the accelerator sensor, low values
-#define PSENS_LOW           A0
+#define SIGNAL_INPUT_A      A0
 
 // Sensing input for the DAC output
-#define PSENS_LOW_SPOOF     A2
+#define SPOOF_SIGNAL_A      A2
 
 // Sensor wire from the accelerator sensor, high values
-#define PSENS_HIGH          A1
+#define SIGNAL_INPUT_B      A1
 
 // Sensing input for the DAC output
-#define PSENS_HIGH_SPOOF    A3
+#define SPOOF_SIGNAL_B      A3
 
 // Signal interrupt (relay) for low accelerator values (XXX wire)
-#define PSENS_LOW_SIGINT    6
+#define SPOOF_ENGAGE_A      6
 
 // Signal interrupt (relay) for high accelerator values (XXX wire)
-#define PSENS_HIGH_SIGINT   7
+#define SPOOF_ENGAGE_B      7
 
 // set up values for use in the steering control system
-uint16_t PSensL_current,        // Current measured accel sensor values
-         PSensH_current,
-         PSpoofH,               // Current spoofing values
-         PSpoofL;
+uint16_t sig_a_current,         // Current measured accel sensor values
+         sig_b_current,
+         sig_a_previous,        // Previous measured accel sensor values
+         sig_b_previous,
+         spoof_a_current,       // Current spoofing values
+         spoof_b_current;
 
 // CAN message structs
 can_frame_s can_frame;
@@ -204,7 +206,7 @@ bool control_enable_req,
      control_enabled,
      initial_ADC;
 
-int local_override = 0;
+int local_override = 0;         // Used to flag disableControl( )
 
 double pedal_position_target,
        pedal_position;
@@ -219,7 +221,7 @@ uint8_t incoming_serial_byte;
 /* ====================================== */
 
 
-// a function to set the DAC output registers
+// a function to set the DAC k registers
 void set_DAC( uint16_t data, char channel )
 {
     uint8_t message[ 2 ];
@@ -272,24 +274,24 @@ void enable_control( )
 
     for ( int i = 0; i < AVG_max; i++ )
     {
-        readingsL += analogRead( PSENS_LOW ) << 2;
-        readingsH += analogRead( PSENS_HIGH ) << 2;
+        readingsL += analogRead( SIGNAL_INPUT_A ) << 2;
+        readingsH += analogRead( SIGNAL_INPUT_B ) << 2;
     }
 
-    PSensL_current = readingsL / AVG_max;
-    PSensH_current = readingsH / AVG_max;
+    sig_a_current = readingsL / AVG_max;
+    sig_b_current = readingsH / AVG_max;
 
     // write measured torque values to DAC to avoid a signal discontinuity
-    set_DAC( PSensH_current, 'B' );
-    set_DAC( PSensL_current, 'A' );
+    set_DAC( sig_b_current, 'B' );
+    set_DAC( sig_a_current, 'A' );
     latch_DAC( );
 
     // TODO: check if the DAC value and the sensed values are the same.
     // If not, return an error and do NOT enable the sigint relays.
 
     // enable the signal interrupt relays
-    digitalWrite( PSENS_LOW_SIGINT, LOW );
-    digitalWrite( PSENS_HIGH_SIGINT, LOW );
+    digitalWrite( SPOOF_ENGAGE_A, LOW );
+    digitalWrite( SPOOF_ENGAGE_B, LOW );
 
     control_enabled = true;
 
@@ -304,22 +306,22 @@ void disable_control( )
     uint16_t readingsH = 0;
 
     for ( int i = 0; i < AVG_max; i++ ) {
-        readingsL += analogRead( PSENS_LOW ) << 2;
-        readingsH += analogRead( PSENS_HIGH ) << 2;
+        readingsL += analogRead( SIGNAL_INPUT_A ) << 2;
+        readingsH += analogRead( SIGNAL_INPUT_B ) << 2;
     }
 
-    PSensL_current = readingsL / AVG_max;
-    PSensH_current = readingsH / AVG_max;
+    sig_a_current = readingsL / AVG_max;
+    sig_b_current = readingsH / AVG_max;
 
     // write measured torque values to DAC to avoid a signal discontinuity
-    set_DAC( PSensH_current, 'B' );
-    set_DAC( PSensL_current, 'A' );
+    set_DAC( sig_b_current, 'B' );
+    set_DAC( sig_a_current, 'A' );
     latch_DAC( );
 
 
     // disable the signal interrupt relays
-    digitalWrite( PSENS_LOW_SIGINT, HIGH );
-    digitalWrite( PSENS_HIGH_SIGINT, HIGH );
+    digitalWrite( SPOOF_ENGAGE_A, HIGH );
+    digitalWrite( SPOOF_ENGAGE_B, HIGH );
 
     control_enabled = false;
 }
@@ -330,22 +332,24 @@ void calculate_pedal_spoof( float pedal_position )
     // values calculated with min/max calibration curve and hand tuned for
     // neutral balance.
     // DAC requires 12-bit values, (4096steps/5V = 819.2 steps/V)
-    PSpoofL = 819.2 * ( 0.0004 * pedal_position + 0.366 );
-    PSpoofH = 819.2 * ( 0.0008 * pedal_position + 0.732 );
+    spoof_a_current = 819.2 * ( 0.0004 * pedal_position + 0.366 );
+    spoof_b_current = 819.2 * ( 0.0008 * pedal_position + 0.732 );
 
-    PSpoofL = constrain( PSpoofL, 0, 1800 ); // range = 300 - ~1750
-    PSpoofH = constrain( PSpoofH, 0, 3500 ); // range = 600 - ~3500
+    // range = 300 - ~1750
+    spoof_a_current = constrain( spoof_a_current, 0, 1800 );
+    // range = 600 - ~3500
+    spoof_b_current = constrain( spoof_b_current, 0, 3500 );
 
     //Serial.print("PSPOOF_LOW:");
-    //Serial.print(PSpoofL);
+    //Serial.print(spoof_a_current);
     //Serial.print("PSPOOF_LOW");
-    //Serial.println(PSpoofH);
+    //Serial.println(spoof_b_current);
 }
 
 //
 void check_pedal_override( )
 {
-    if ( ( PSensL_current + PSensH_current) / 2 > PEDAL_THRESH )
+    if ( ( sig_a_current + sig_b_current ) / 2 > PEDAL_THRESH )
     {
         disable_control( );
         local_override = 1;
@@ -357,61 +361,94 @@ void check_pedal_override( )
 }
 
 //
-void check_spoof_voltage( bool firstADC )
+void check_spoof_voltage( bool first_ADC, uint16_t sig_a, uint16_t sig_b )
 {
-    if ( firstADC == true )
+    if ( first_ADC == true )
     {
         return;
     }
 
-    int psens_l_signal_read = 0;
-    int psens_h_signal_read = 0;
-    int spoof_l_signal_read = 0;
-    int spoof_h_signal_read = 0;
+    int input_a_sig_previous = int( sig_a );
+    int input_b_sig_previous = int( sig_b );
 
-    float psens_l_voltage_read = 0;
-    float psens_h_voltage_read = 0;
-    float spoof_l_voltage_read = 0;
-    float spoof_h_voltage_read = 0;
+    int input_a_signal_read = 0;
+    int input_b_signal_read = 0;
+    int spoof_a_signal_read = 0;
+    int spoof_b_signal_read = 0;
+
+    float input_a_volt_previous = 0.0;
+    float input_b_volt_previous = 0.0;
+
+    float input_a_voltage_read = 0.0;
+    float input_b_voltage_read = 0.0;
+    float spoof_a_voltage_read = 0.0;
+    float spoof_b_voltage_read = 0.0;
 
     // energize the relay so we can read the values at the terminal
-    digitalWrite( PSENS_LOW_SIGINT, HIGH );
+    digitalWrite( SPOOF_ENGAGE_A, HIGH );
 
-    psens_l_signal_read = analogRead( PSENS_LOW );
-    psens_h_signal_read = analogRead( PSENS_HIGH );
-    spoof_l_signal_read = analogRead( PSENS_LOW_SPOOF );
-    spoof_h_signal_read = analogRead( PSENS_HIGH_SPOOF );
+    input_a_signal_read = analogRead( SIGNAL_INPUT_A );
+    input_b_signal_read = analogRead( SIGNAL_INPUT_B );
+    spoof_a_signal_read = analogRead( SPOOF_SIGNAL_A );
+    spoof_b_signal_read = analogRead( SPOOF_SIGNAL_B );
 
-    psens_l_voltage_read = psens_l_signal_read * 5.0 / 1024.0;
-    psens_h_voltage_read = psens_h_signal_read * 5.0 / 1024.0;
-    spoof_l_voltage_read = spoof_l_signal_read * 5.0 / 1024.0;
-    spoof_h_voltage_read = spoof_h_signal_read * 5.0 / 1024.0;
+    input_a_voltage_read = input_a_signal_read * 5.0 / 1024.0;
+    input_b_voltage_read = input_b_signal_read * 5.0 / 1024.0;
+    spoof_a_voltage_read = spoof_a_signal_read * 5.0 / 1024.0;
+    spoof_b_voltage_read = spoof_b_signal_read * 5.0 / 1024.0;
 
-    Serial.print( "Psens Low Value: " );
-    Serial.print( psens_l_signal_read );
-    Serial.print( "\tPsens Low Voltage: " );
-    Serial.println( psens_l_voltage_read, 3 );
+    input_a_volt_previous = input_a_sig_previous * 5.0 / 1024.0;
+    input_b_volt_previous = input_b_sig_previous * 5.0 / 1024.0;
 
-    Serial.print( "Spoof Low Value: " );
-    Serial.print( spoof_l_signal_read );
-    Serial.print( "\tSpoof Low Voltage: " );
-    Serial.println( spoof_l_voltage_read, 3 );
+    Serial.print( "Signal A Value: " );
+    Serial.print( input_a_signal_read );
+    Serial.print( "\tSignal A Voltage: " );
+    Serial.println( input_a_voltage_read, 3 );
 
-    Serial.print( "Psens High Value: " );
-    Serial.print( psens_l_signal_read );
-    Serial.print( "\tPsens High Voltage: " );
-    Serial.println( psens_l_voltage_read, 3 );
+    Serial.print( "Spoof A Value: " );
+    Serial.print( spoof_a_signal_read );
+    Serial.print( "\tSpoof A Voltage: " );
+    Serial.println( spoof_a_voltage_read, 3 );
 
-    Serial.print( "Spoof High Value: " );
-    Serial.print( spoof_h_signal_read );
-    Serial.print( "\tSpoof High Voltage: " );
-    Serial.println( spoof_h_voltage_read, 3 );
+    Serial.print( "Signal B Value: " );
+    Serial.print( input_b_signal_read );
+    Serial.print( "\tSignal B Voltage: " );
+    Serial.println( input_b_voltage_read, 3 );
 
-    //debug signals then writeout fail criteria.
+    Serial.print( "Spoof B Value: " );
+    Serial.print( spoof_b_signal_read );
+    Serial.print( "\tSpoof B Voltage: " );
+    Serial.println( spoof_b_voltage_read, 3 );
+
+    if ( abs( spoof_a_voltage_read - input_a_voltage_read ) > 0.050 )
+    {
+        Serial.println( "* * * ERROR!!  Discrepancy on SigA. * * *");
+    }
+
+    if ( abs( spoof_b_voltage_read - input_b_voltage_read ) > 0.050 )
+    {
+        Serial.println( "* * * ERROR!!  Discrepancy on SigB. * * *");
+    }
+
+    Serial.print( "Previous Signal A Value: " );
+    Serial.print( input_a_sig_previous );
+    Serial.print( "\tSignal A Voltage: " );
+    Serial.println( input_a_volt_previous, 3 );
+
+    Serial.print( "Previous Signal B Value: " );
+    Serial.print( input_b_sig_previous );
+    Serial.print( "\tSignal B Voltage: " );
+    Serial.println( input_a_volt_previous, 3 );
+
+    Serial.println( " * * * * * " );
+
+    //debug signals then writeout fail criteria. ~ ( < | 50mV | )
     //disable_control( );
     //local_override = 1;
 
 }
+
+// check_PWM( )
 
 
 
@@ -605,12 +642,12 @@ void setup( )
     pinMode( LDAC, OUTPUT );
     pinMode( DAC_CS, OUTPUT );
     pinMode( DAC_PWR, OUTPUT );
-    pinMode( PSENS_LOW, INPUT );
-    pinMode( PSENS_LOW_SPOOF, INPUT );
-    pinMode( PSENS_HIGH, INPUT );
-    pinMode( PSENS_HIGH_SPOOF, INPUT );
-    pinMode( PSENS_LOW_SIGINT, OUTPUT );
-    pinMode( PSENS_HIGH_SIGINT, OUTPUT );
+    pinMode( SIGNAL_INPUT_A, INPUT );
+    pinMode( SPOOF_SIGNAL_A, INPUT );
+    pinMode( SIGNAL_INPUT_B, INPUT );
+    pinMode( SPOOF_SIGNAL_B, INPUT );
+    pinMode( SPOOF_ENGAGE_A, OUTPUT );
+    pinMode( SPOOF_ENGAGE_B, OUTPUT );
 
     // initialize the DAC board
     digitalWrite( DAC_PWR, HIGH );    // Supply power
@@ -619,8 +656,8 @@ void setup( )
     digitalWrite( LDAC, HIGH );       // Reset data
 
     // initialize relay board
-    digitalWrite( PSENS_LOW_SIGINT, HIGH );
-    digitalWrite( PSENS_HIGH_SIGINT, HIGH );
+    digitalWrite( SPOOF_ENGAGE_A, HIGH );
+    digitalWrite( SPOOF_ENGAGE_B, HIGH );
 
     init_serial( );
 
@@ -660,12 +697,15 @@ void loop( )
 
     check_rx_timeouts( );
 
+    sig_a_previous = sig_a_current;
+    sig_b_previous = sig_b_current;
+
     // update state variables
-    PSensL_current = analogRead( PSENS_LOW ) << 2;  //10 bit to 12 bit
-    PSensH_current = analogRead( PSENS_HIGH ) << 2;
+    sig_a_current = analogRead( SIGNAL_INPUT_A ) << 2;  //10 bit to 12 bit
+    sig_b_current = analogRead( SIGNAL_INPUT_B ) << 2;
 
     // if someone is pressing the throttle pedal disable control
-    if ( ( PSensL_current + PSensH_current) / 2 > PEDAL_THRESH )
+    if ( ( sig_a_current + sig_b_current) / 2 > PEDAL_THRESH )
     {
         disable_control( );
         local_override = 1;
@@ -679,7 +719,7 @@ void loop( )
 
     check_pedal_override( );
 
-    check_spoof_voltage( initial_ADC );
+    check_spoof_voltage( initial_ADC, sig_a_previous, sig_b_previous );
 
     /* End Untested */
 
@@ -699,12 +739,12 @@ void loop( )
         //Serial.print("pedal_position_target = ");
         //Serial.print(pedal_position_target);
         //Serial.print(" Spoof error, H = ");
-        //Serial.print(PSpoofH - (analogRead(PSENS_HIGH_SPOOF) << 2));
+        //Serial.print(spoof_b_current - (analogRead(SPOOF_SIGNAL_B) << 2));
         //Serial.print(" Spoof error L = ");
-        //Serial.println(PSpoofL - (analogRead(PSENS_LOW_SPOOF) << 2));
+        //Serial.println(spoof_a_current - (analogRead(SPOOF_SIGNAL_A) << 2));
 
-        set_DAC( PSpoofH, 'B' );
-        set_DAC( PSpoofL, 'A' );
+        set_DAC( spoof_b_current, 'B' );
+        set_DAC( spoof_a_current, 'A' );
         latch_DAC( );
 
         //check_spoof_voltage( initial_ADC );
